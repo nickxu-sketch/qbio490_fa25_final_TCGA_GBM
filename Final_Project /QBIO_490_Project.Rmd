@@ -1,0 +1,687 @@
+---
+title: "QBIO 490 Nick Leon Bruk"
+author: "Nick Xu, Leon Chen, Bruk Tefera"
+date: "2025-12-06"
+output: html_document
+---
+```{r}
+knitr::opts_knit$set(root.dir = normalizePath("/home1/nickxu/490_cluster/analysis_data"))  
+```
+
+#I remove the ggsave from the code because everyone has very different directory. It might interfere with running the code when you are grading it :) Nick 
+
+#Nick Xu did OS Clustering, clinical analysis, and MAF analysis. Leon did methylation analysis. Bruk did transcrptomics. Nick combine the code together
+```{r}
+if (!require("knitr", quietly = TRUE)) 
+install.packages("knitr") 
+if (!require("BiocManager", quietly = TRUE)) 
+install.packages("BiocManager") 
+BiocManager::install(version = "3.21") 
+if (!require("TCGAbiolinks", quietly = TRUE))  
+BiocManager::install("TCGAbiolinks")
+if (!require("maftools", quietly = TRUE)) 
+BiocManager::install("maftools")
+if (!require("sesameData", quietly = TRUE))
+BiocManager::install("sesameData")
+if (!require("sesame", quietly = TRUE))
+BiocManager::install("sesame")
+if (!require("limma", quietly = TRUE))
+BiocManager::install("limma")
+if (!require("dplyr", quietly = TRUE))
+BiocManager::install("dplyr")
+if (!require("stringr", quietly = TRUE))
+BiocManager::install("stringr")
+if (!require("survival", quietly = TRUE))
+BiocManager::install("survival")
+if (!require("survminer", quietly = TRUE))
+BiocManager::install("survminer")
+if (!require("ggplot2", quietly = TRUE))
+BiocManager::install("ggplot2")
+if (!require("ggrepel", quietly = TRUE))
+BiocManager::install("ggrepel")
+if (!require("SummarizedExperiment", quietly = TRUE))
+BiocManager::install("SummarizedExperiment")
+if (!require("DESeq2", quietly = TRUE))
+BiocManager::install("DESeq2")
+if (!require("pheatmap", quietly = TRUE))
+BiocManager::install("pheatmap")
+if (!require("httr", quietly = TRUE))
+BiocManager::install("httr")
+if (!require("org.Hs.eg.db", quietly = TRUE))
+BiocManager::install("org.Hs.eg.db")
+if (!require("AnnotationDbi", quietly = TRUE))
+BiocManager::install("AnnotationDbi")
+if (!require("tibble", quietly = TRUE))
+BiocManager::install("tibble")
+```
+
+```{r}
+library(knitr)
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+library(sesameData)
+library(sesame)
+library(limma)
+library(dplyr)
+library(stringr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(ggrepel)
+library(SummarizedExperiment)
+library(DESeq2)
+library(pheatmap)
+library(httr)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(tibble)
+
+```
+
+#Clinical Data Downloading
+```{r}
+clin_query <- GDCquery(project = "TCGA-GBM",                       
+                       data.category = "Clinical",                       
+                       data.type = "Clinical Supplement",                        
+                       data.format = 'BCR Biotab') 
+GDCdownload(clin_query)
+clinical.BCRtab.all <- GDCprepare(clin_query) 
+clinic <- clinical.BCRtab.all$clinical_patient_gbm[-c(1,2),] 
+drug   <- clinical.BCRtab.all$clinical_drug_gbm[-c(1,2),]
+```
+
+#Drug and patient indication based on TMZ
+```{r}
+drug$drug_name <- tolower(drug$pharmaceutical_therapy_drug_name)
+drug$tmz_status <- grepl("temozolomide", drug$drug_name)
+
+drug <- mutate(
+  drug,
+  drug_name    = tolower(pharmaceutical_therapy_drug_name),
+  tmz_status = grepl("temozolomide", drug_name)
+)
+
+```
+
+#Grouping patient based on Drug use and filter TMZ patient 
+```{r}
+drug_grouped <- group_by(drug, bcr_patient_barcode)
+
+tmz_by_patient <- summarise(drug_grouped, tmz_treated = any(tmz_status, na.rm = TRUE))
+```
+
+#Add TMZ column to clinic table. Create TMZ and NO_TMZ factor for future graphing 
+```{r}
+clinic <- clinic %>%
+  left_join(tmz_by_patient, by = "bcr_patient_barcode") %>%
+  mutate(
+    tmz_treated = ifelse(is.na(tmz_treated), FALSE, tmz_treated),
+    tmz_group   = ifelse(tmz_treated, "TMZ", "No_TMZ"),
+    tmz_group   = factor(tmz_group, levels = c("No_TMZ", "TMZ"))
+  )
+```
+
+#Visualization
+```{r}
+table(clinic$tmz_group)
+```
+
+#Compute OS
+```{r}
+clinic <- clinic %>%
+  mutate(
+    last_contact_days_to = as.numeric(last_contact_days_to),
+    death_days_to = as.numeric(death_days_to),
+    OS_event = ifelse(vital_status == "Dead", 1, 0),
+    OS_days = ifelse(OS_event == 1, death_days_to , last_contact_days_to),
+    OS_months = OS_days / 30.44
+  )%>%
+  filter(!is.na(OS_months))
+```
+
+#Filter only TMZ treated patient
+```{r}
+clin_tmz <- filter(clinic, tmz_treated == TRUE)
+```
+
+#Assign Responder Groups 
+```{r}
+clin_tmz$responder<- ifelse(
+  clin_tmz$OS_months >= 18, "Good_responder",
+  ifelse(clin_tmz$OS_months <= 12, "Poor_responder", "Intermediate")
+)
+
+clin_tmz_filtered <- clin_tmz %>%
+  filter(responder != "Intermediate")
+
+```
+
+```{r}
+table(clin_tmz_filtered$responder)
+```
+
+#KM plot Good vs Poor 
+```{r}
+survival_object <- Surv(time = clin_tmz_filtered$OS_months,event = clin_tmz_filtered$OS_event)
+fit_object <- survfit(survival_object ~ responder, data = clin_tmz_filtered)
+
+survplot <- ggsurvplot(fit_object,
+                       pval=TRUE,
+                       ggtheme = theme(plot.margin = unit(c(1,1,1,1), "cm")),
+                       legend = 'right')
+
+KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20), 
+                                              axis.text = element_text(size=16),
+                                              legend.title = element_text(size=14),
+                                              legend.text = element_text(size=12))+
+  labs(
+    x = "Overall Survival (months)",
+    y = "Survival Probability",
+    title = "Kaplan–Meier: Good vs Poor Responders"
+  )
+
+KM_plot
+
+
+
+
+```
+
+#KM plot TMZ vs non_TMZ
+```{r}
+survival_object <- Surv(time = clinic$OS_months,event = clinic$OS_event)
+
+fit_object <- survfit(survival_object ~ tmz_group, data = clinic)
+
+survplot <- ggsurvplot(fit_object,
+                       pval=TRUE,
+                       ggtheme = theme(plot.margin = unit(c(1,1,1,1), "cm")),
+                       legend = 'right')
+
+KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20), 
+                                              axis.text = element_text(size=16),
+                                              legend.title = element_text(size=14),
+                                              legend.text = element_text(size=12))+
+
+  labs(
+    x = "Overall Survival (months)",
+    y = "Survival Probability",
+    title = "Kaplan–Meier: TMZ vs No TMZ"
+  )
+
+KM_plot
+
+```
+
+#MAF Analysis
+```{r}
+names(clin_tmz_filtered)[names(clin_tmz_filtered) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
+```
+
+#Dowload MAf
+```{r}
+maf_query <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Simple Nucleotide Variation",
+  access = "open",
+  data.type = "Masked Somatic Mutation",
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+GDCdownload(maf_query, method = "api", files.per.chunk = 100)
+maf_data <- GDCprepare(maf_query)
+maf_object <- read.maf(
+  maf = maf_data,
+  clinicalData = clin_tmz_filtered,
+  isTCGA = TRUE
+)
+```
+
+#Define Mask
+```{r}
+mask_good <- maf_object@clinical.data$responder == "Good_responder"
+mask_poor <- maf_object@clinical.data$responder == "Poor_responder"
+```
+
+#Subset
+```{r}
+maf_good <- subsetMaf(maf = maf_object, tsb = maf_object@clinical.data$Tumor_Sample_Barcode[mask_good])
+maf_poor <- subsetMaf(maf = maf_object, tsb = maf_object@clinical.data$Tumor_Sample_Barcode[mask_poor])
+```
+
+#Co-oncoplot
+```{r}
+coOncoplot(
+  m1 = maf_good,
+  m2 = maf_poor,
+  m1Name = "Good Responders",
+  m2Name = "Poor Responders"
+)
+
+```
+
+#Co-lollipop
+```{r}
+par(mfrow = c(3,1))
+
+lollipopPlot2(m1 = maf_good, m2 = maf_poor,
+              m1_name = "Good Responders",
+              m2_name = "Poor Responders",
+              gene = "PTEN")
+
+lollipopPlot2(m1 = maf_good, m2 = maf_poor,
+              m1_name = "Good Responders",
+              m2_name = "Poor Responders",
+              gene = "TP53")
+
+lollipopPlot2(m1 = maf_good, m2 = maf_poor,
+              m1_name = "Good Responders",
+              m2_name = "Poor Responders",
+              gene = "EGFR")
+
+par(mfrow = c(1,1))
+
+```
+
+#Contingency table
+```{r}
+get_mut_status <- function(maf_object, gene){
+  mutated_samples <- subsetMaf(
+    maf = maf_object,
+    genes = gene,
+    fields = "Tumor_Sample_Barcode"
+  )@data$Tumor_Sample_Barcode
+
+  clin_tmz_filtered$Tumor_Sample_Barcode %in% mutated_samples
+}
+
+clin_tmz_filtered$PTEN_mut <- get_mut_status(maf_object, "PTEN")
+clin_tmz_filtered$TP53_mut <- get_mut_status(maf_object, "TP53")
+clin_tmz_filtered$EGFR_mut <- get_mut_status(maf_object, "EGFR")
+
+pten_table <- table(clin_tmz_filtered$responder, clin_tmz_filtered$PTEN_mut)
+tp53_table <- table(clin_tmz_filtered$responder, clin_tmz_filtered$TP53_mut)
+egfr_table <- table(clin_tmz_filtered$responder, clin_tmz_filtered$EGFR_mut)
+
+cat("PTEN Contingency Table:\n"); print(pten_table)
+cat("\nTP53 Contingency Table:\n"); print(tp53_table)
+cat("\nEGFR Contingency Table:\n"); print(egfr_table)
+
+cat("\nPTEN Fisher Test:\n")
+print(fisher.test(pten_table))
+
+cat("\nTP53 Fisher Test:\n")
+print(fisher.test(tp53_table))
+
+cat("\nEGFR Fisher Test:\n")
+print(fisher.test(egfr_table))
+
+par(mfrow = c(1, 3))  # 3 plots in one row
+
+# PTEN barplot
+barplot(
+  pten_table,
+  beside = TRUE,
+  col = c("skyblue", "salmon"),
+  legend = TRUE,
+  main = "PTEN Mutation vs Responders",
+  xlab = "Mutation Status (FALSE = No, TRUE = Yes)",
+  ylab = "Patient Count"
+)
+
+# TP53 barplot
+barplot(
+  tp53_table,
+  beside = TRUE,
+  col = c("skyblue", "salmon"),
+  legend = TRUE,
+  main = "TP53 Mutation vs Responders",
+  xlab = "Mutation Status",
+  ylab = "Patient Count"
+)
+
+# EGFR barplot
+barplot(
+  egfr_table,
+  beside = TRUE,
+  col = c("skyblue", "salmon"),
+  legend = TRUE,
+  main = "EGFR Mutation vs Responders",
+  xlab = "Mutation Status",
+  ylab = "Patient Count"
+)
+
+par(mfrow = c(1, 1))  # reset plotting layout
+
+```
+
+#Methylation Analysis
+```{r}
+#Download GBM Methylation Data
+library(TCGAbiolinks)
+
+meth_query <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+)
+
+GDCdownload(meth_query)
+
+meth_data <- GDCprepare(meth_query)
+
+
+#check the data
+View(meth_data)
+
+# Extract Beta values (CpG sites x samples)
+beta_matrix <- assay(meth_data, 1) 
+
+#Can't view it for some reason, check dimensions
+dim(beta_matrix)
+
+#Extract sample metadata
+sample_info <- colData(meth_data)
+head(sample_info$bcr_patient_barcode)
+```
+
+```{r}
+#Subsetting TMZ patients into good and poor responders
+#Extract patient carcodes
+sample_info$patient_barcode <- substr(sample_info$bcr_patient_barcode, 1, 12)
+head(sample_info$patient_barcode)
+
+# Keep only methylation samples for TMZ-treated patients
+tmz_patients <- rownames(clin_tmz_filtered)
+meth_tmz_samples <- sample_info$bcr_patient_barcode[sample_info$patient_barcode %in% tmz_patients]
+
+length(meth_tmz_samples)
+head(meth_tmz_samples)
+
+# Truncate both methylation matrix and selected samples to first 15 characters
+beta_sample_ids <- substr(colnames(beta_matrix), 1, 15)
+meth_tmz_samples_short <- substr(meth_tmz_samples, 1, 15)
+
+# Subset beta matrix for TMZ patients
+beta_tmz <- beta_matrix[, beta_sample_ids %in% meth_tmz_samples_short]
+dim(beta_tmz)
+head(colnames(beta_tmz))
+
+#Match good vs poor response to each filtered patient
+responder_status <- clin_tmz_filtered$responder[
+  match(
+    substr(colnames(beta_tmz), 1, 12),  
+    rownames(clin_tmz_filtered)
+  )
+]
+
+#Factorize
+responder_status <- factor(responder_status, levels = c("Poor_responder", "Good_responder"))
+table(responder_status)
+
+#Transform into beta-values for graphical analysis, as done in the methylation companion
+#Filtered NAs
+beta_tmz_clean <- beta_tmz[complete.cases(beta_tmz), ]
+#Avoid 0/1s
+beta_tmz_safe <- pmin(pmax(beta_tmz_clean, 0.001), 0.999)
+mval <- t(apply(beta_tmz_safe, 1, function(x) log2(x / (1 - x))))
+
+#Check dimensions and a small preview
+dim(mval)
+head(mval[, 1:5])
+```
+
+```{r}
+#Design matrix for Good vs Poor responders
+design <- model.matrix(~ responder_status)
+colnames(design) <- c("Intercept", "Good_vs_Poor")
+
+#Need to fit the linear model
+fit <- lmFit(mval, design)
+#Other step from methylation companion
+fit <- eBayes(fit)
+
+# Extract top differentially methylated CpGs
+top_cpgs <- topTable(fit, coef = "Good_vs_Poor", adjust.method = "BY", number = 50)
+#head(top_cpgs)
+```
+
+#Volcano plot
+```{r}
+# Create threshold for highlighting significant CpGs
+top_cpgs$threshold <- as.factor(abs(top_cpgs$logFC) < 1)  # TRUE = not significant, FALSE = significant
+
+# Set colors
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+
+# Make the volcano plot
+volcano_plot <- ggplot(top_cpgs, aes(x = logFC, y = -log10(adj.P.Val), color = threshold)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") +
+  geom_vline(xintercept = -1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour="#990000", linetype="dashed") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  xlab("M-value Fold Change (Good vs Poor)") +
+  ylab("-log10(BY-adjusted p-value)")
+
+
+print(volcano_plot)
+```
+
+#result table of all CpG's
+```{r}
+full_tt <- topTable(fit, coef = "Good_vs_Poor", number = Inf, adjust.method = "BY")
+full_tt$CpG <- rownames(full_tt)
+
+#annotation from sesame?
+annot_df <- as.data.frame(rowRanges(meth_data))
+annot_df$CpG <- rownames(annot_df)
+
+colnames(annot_df)
+
+annotation_column <- "gene"
+
+full_annotated <- left_join(
+  full_tt,
+  annot_df[, c("CpG", annotation_column)],
+  by = "CpG"
+)
+
+#gene name cleaned
+full_annotated$geneName <- full_annotated[[annotation_column]]
+full_annotated$geneName <- ifelse(
+  is.na(full_annotated$geneName) | full_annotated$geneName == "",
+  NA_character_,
+  full_annotated$geneName
+)
+
+#splitting gene strings with multiple genes
+full_annotated$geneName <- sapply(
+  strsplit(full_annotated$geneName, ";"),
+  function(x) if (length(x) >= 1) x[1] else NA_character_
+)
+
+#dataframe, from methylation companion assignment
+dat <- data.frame(
+  foldchange = full_annotated$logFC,
+  logPvalue  = -log10(p.adjust(full_annotated$P.Value, method = "BY")),
+  geneName   = full_annotated$geneName,
+  stringsAsFactors = FALSE
+)
+
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+
+#plotting
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+
+volcano_plot1 <- ggplot(data = dat, aes(x = foldchange, y = logPvalue, color = threshold)) +
+  geom_point(alpha = .2, size = 0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour = "#990000", linetype = "dashed") +
+  geom_vline(xintercept = -1, colour = "#990000", linetype = "dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype = "dashed") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  xlab("Fold Change (M-value)") +
+  ylab("-log10(BY-adjusted p-value)")
+
+print(volcano_plot1)
+
+#labeled plot
+top_hits <- dat[order(-dat$logPvalue), ] %>% 
+  head(15)   # choose top 15 significant CpGs
+
+volcano_labeled <- volcano_plot1 +
+  geom_text_repel(
+    data = top_hits,
+    aes(x = foldchange, y = logPvalue, label = geneName),
+    size = 3,
+    max.overlaps = 50
+  )
+
+print(volcano_labeled)
+```
+
+#RNASeq Downloading
+```{r}
+rna_query <- GDCquery(
+  project = "TCGA-GBM",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(rna_query)
+rna_data <- GDCprepare(rna_query)
+```
+
+#Transcriptomics Analysis
+```{r}
+counts_matrix <- assay(rna_data)
+
+sample_ids <- substr(colnames(counts_matrix), 1, 12)
+colnames(counts_matrix) <- sample_ids
+
+# Build clinical annotation dataframe for DESeq2: patient barcode + TMZ response group
+col_data <- clin_tmz_filtered %>%
+  dplyr::select(bcr_patient_barcode, responder) %>%
+  dplyr::distinct() %>%
+  tibble::column_to_rownames("bcr_patient_barcode")
+
+common_samples <- intersect(colnames(counts_matrix), rownames(col_data))
+
+# Keep only samples appearing in both datasets 
+counts_matrix <- counts_matrix[, common_samples]
+col_data <- col_data[common_samples, , drop = FALSE]
+
+# Create DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_matrix,
+  colData   = col_data,
+  design    = ~ responder
+)
+
+dds <- DESeq(dds)
+vsd <- vst(dds, blind = FALSE)
+
+res_df <- as.data.frame(DESeq2::results(dds))
+
+# Clean Ensembl IDs
+res_df$gene_id <- gsub("\\..*", "", rownames(res_df))
+
+# Map gene symbols
+res_df$gene_symbol <- mapIds(
+  org.Hs.eg.db,
+  keys      = res_df$gene_id,
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+
+res_df_plot <- res_df %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::mutate(
+    significance = case_when(
+      padj < 0.05 & log2FoldChange >  1 ~ "Up in Good",
+      padj < 0.05 & log2FoldChange < -1 ~ "Up in Poor",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+ggplot(
+  res_df_plot,
+  aes(log2FoldChange, -log10(padj), color = significance)
+) +
+  geom_point(alpha = 0.6, size = 1.6) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text_repel(
+    data = subset(res_df_plot, significance != "Not Significant"),
+    aes(label = gene_symbol),
+    size = 3,
+    max.overlaps = 12
+  ) +
+  scale_color_manual(values = c("grey70", "blue", "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot: Good vs Poor TMZ Responders",
+    x = "log2 Fold Change (Good vs Poor)",
+    y = "-log10 Adjusted P-value",
+    color = "significance"
+  )
+
+top_10_genes <- res_df %>%
+  dplyr::filter(!is.na(padj)) %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice(1:10) %>%
+  dplyr::pull(gene_id)
+
+# Clean vsd rownames
+vsd_ids_clean <- gsub("\\..*", "", rownames(vsd))
+
+# Match top genes to vsd rows
+row_idx <- match(top_10_genes, vsd_ids_clean)
+valid <- !is.na(row_idx)
+
+row_idx <- row_idx[valid]
+top_10_genes <- top_10_genes[valid]
+
+# Extract expression matrix
+heatmap_data <- assay(vsd)[row_idx, ]
+
+# Assign gene symbols as rownames
+rownames(heatmap_data) <- res_df$gene_symbol[
+  match(top_10_genes, res_df$gene_id)
+]
+
+col_annotation <- data.frame(responder = col_data$responder)
+rownames(col_annotation) <- rownames(col_data)
+
+# Order samples by responder
+ord <- order(col_annotation$responder)
+
+
+# 10. Heatmap
+pheatmap(
+  heatmap_data[, ord],
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  show_rownames = TRUE,
+  show_colnames = FALSE,
+  annotation_col = col_annotation[ord, , drop = FALSE],
+  annotation_colors = list(
+    responder = c(
+      Good_responder = "blue",
+      Poor_responder = "red"
+    )
+  ),
+  main = "Top 10 Differentially Expressed Genes (by TMZ Response)"
+)
+
+```
+
